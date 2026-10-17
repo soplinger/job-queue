@@ -1,8 +1,9 @@
 """A SQLite-backed job queue with leases, retries, and dead-lettering. Standard library only.
 
-A worker claims a job for a lease period. If it does not finish in time, the job goes back
-to the queue. Each claim returns an attempt number, and only the holder of the latest attempt
-can complete or fail the job, so a stale worker cannot overwrite a newer one.
+A worker claims a job for a lease period. If it does not finish before the lease ends, the job
+goes back to the queue (or to dead, once its attempts are used up). Each claim returns an attempt
+number, and only the holder of the latest attempt, with a lease that has not ended, can complete
+or fail the job. A stale worker therefore cannot overwrite a newer one.
 """
 
 import json
@@ -35,8 +36,10 @@ class Queue:
         )
 
     def enqueue(self, payload: dict, max_attempts: int = 3) -> int:
-        if max_attempts < 1:
-            raise ValueError("max_attempts must be at least 1")
+        if not isinstance(payload, dict):
+            raise ValueError("payload must be a dict")
+        if not isinstance(max_attempts, int) or isinstance(max_attempts, bool) or max_attempts < 1:
+            raise ValueError("max_attempts must be an integer of at least 1")
         cur = self.conn.execute(
             "INSERT INTO jobs (payload, status, max_attempts) VALUES (?, 'queued', ?)",
             (json.dumps(payload), max_attempts),
@@ -45,17 +48,12 @@ class Queue:
 
     def claim(self, lease_seconds: float = 60) -> Optional[Job]:
         """Give the next queued job to a worker, or return None if there is none."""
+        if lease_seconds <= 0:
+            raise ValueError("lease_seconds must be positive")
         now = self.clock()
         self.conn.execute("BEGIN IMMEDIATE")
         try:
-            # Jobs whose lease ran out go back to the queue, or to dead if no attempts are left.
-            self.conn.execute(
-                "UPDATE jobs SET"
-                " status = CASE WHEN attempts >= max_attempts THEN 'dead' ELSE 'queued' END,"
-                " last_error = COALESCE(last_error, 'lease expired')"
-                " WHERE status = 'running' AND lease_until < ?",
-                (now,),
-            )
+            self._expire_leases(now)
             row = self.conn.execute(
                 "SELECT id, payload FROM jobs WHERE status = 'queued' ORDER BY id LIMIT 1"
             ).fetchone()
@@ -75,33 +73,47 @@ class Queue:
             self.conn.execute("ROLLBACK")
             raise
 
+    def _expire_leases(self, now: float) -> None:
+        self.conn.execute(
+            "UPDATE jobs SET"
+            " status = CASE WHEN attempts >= max_attempts THEN 'dead' ELSE 'queued' END,"
+            " last_error = 'lease expired',"
+            " lease_until = NULL"
+            " WHERE status = 'running' AND lease_until < ?",
+            (now,),
+        )
+
     def complete(self, job_id: int, attempt: int) -> bool:
-        """Mark a job done. Returns False if this attempt no longer holds the job."""
+        """Mark a job done. Returns False if this attempt no longer holds a live lease."""
         cur = self.conn.execute(
-            "UPDATE jobs SET status = 'done', lease_until = NULL"
-            " WHERE id = ? AND attempts = ? AND status = 'running'",
-            (job_id, attempt),
+            "UPDATE jobs SET status = 'done', lease_until = NULL, last_error = NULL"
+            " WHERE id = ? AND attempts = ? AND status = 'running' AND lease_until >= ?",
+            (job_id, attempt, self.clock()),
         )
         return cur.rowcount == 1
 
     def fail(self, job_id: int, attempt: int, error: str) -> Optional[str]:
-        """Record a failure. Returns the new status (queued or dead), or None if this attempt is stale."""
-        row = self.conn.execute(
-            "SELECT attempts, max_attempts FROM jobs WHERE id = ? AND status = 'running'", (job_id,)
-        ).fetchone()
-        if row is None or row[0] != attempt:
-            return None
-        new_status = "dead" if row[0] >= row[1] else "queued"
-        self.conn.execute(
-            "UPDATE jobs SET status = ?, lease_until = NULL, last_error = ? WHERE id = ?",
-            (new_status, error, job_id),
+        """Record a failure. Returns the new status (queued or dead), or None if this attempt holds no live lease."""
+        cur = self.conn.execute(
+            "UPDATE jobs SET"
+            " status = CASE WHEN attempts >= max_attempts THEN 'dead' ELSE 'queued' END,"
+            " lease_until = NULL, last_error = ?"
+            " WHERE id = ? AND attempts = ? AND status = 'running' AND lease_until >= ?",
+            (error, job_id, attempt, self.clock()),
         )
-        return new_status
+        if cur.rowcount != 1:
+            return None
+        return self.conn.execute("SELECT status FROM jobs WHERE id = ?", (job_id,)).fetchone()[0]
 
     def status(self, job_id: int) -> Optional[dict]:
+        """Current state. A running job whose lease has ended reports 'expired' until the next claim sweeps it."""
         row = self.conn.execute(
-            "SELECT status, attempts, max_attempts, last_error FROM jobs WHERE id = ?", (job_id,)
+            "SELECT status, attempts, max_attempts, last_error, lease_until FROM jobs WHERE id = ?",
+            (job_id,),
         ).fetchone()
         if row is None:
             return None
-        return {"status": row[0], "attempts": row[1], "max_attempts": row[2], "last_error": row[3]}
+        state, attempts, max_attempts, last_error, lease_until = row
+        if state == "running" and lease_until < self.clock():
+            state = "expired"
+        return {"status": state, "attempts": attempts, "max_attempts": max_attempts, "last_error": last_error}
